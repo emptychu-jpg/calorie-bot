@@ -37,6 +37,7 @@ def init_database():
             protein REAL DEFAULT 0,
             fat REAL DEFAULT 0,
             carbs REAL DEFAULT 0,
+            sugar REAL DEFAULT 0,
             fiber REAL DEFAULT 0,
             health_notes TEXT,
             photo_description TEXT
@@ -61,8 +62,8 @@ def save_meal(user_id: int, meal_data: dict):
     cursor = conn.cursor()
     
     cursor.execute("""
-        INSERT INTO meals (user_id, food_name, calories, protein, fat, carbs, fiber, health_notes, photo_description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO meals (user_id, food_name, calories, protein, fat, carbs, sugar, fiber, health_notes, photo_description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         meal_data.get("food_name", "Невідома їжа"),
@@ -70,6 +71,7 @@ def save_meal(user_id: int, meal_data: dict):
         meal_data.get("protein", 0),
         meal_data.get("fat", 0),
         meal_data.get("carbs", 0),
+        meal_data.get("sugar", 0),
         meal_data.get("fiber", 0),
         meal_data.get("health_notes", ""),
         meal_data.get("photo_description", "")
@@ -101,6 +103,7 @@ def get_stats(user_id: int, days: int = 1) -> dict:
             COALESCE(SUM(protein), 0) as total_protein,
             COALESCE(SUM(fat), 0) as total_fat,
             COALESCE(SUM(carbs), 0) as total_carbs,
+            COALESCE(SUM(sugar), 0) as total_sugar,
             COALESCE(SUM(fiber), 0) as total_fiber
         FROM meals 
         WHERE user_id = ? AND {date_filter}
@@ -125,7 +128,8 @@ def get_stats(user_id: int, days: int = 1) -> dict:
         "protein": round(row[2], 1),
         "fat": round(row[3], 1),
         "carbs": round(row[4], 1),
-        "fiber": round(row[5], 1),
+        "sugar": round(row[5], 1),
+        "fiber": round(row[6], 1),
         "meals": meals,
         "days": days
     }
@@ -144,6 +148,7 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None) -> di
     "protein": число (грами білка),
     "fat": число (грами жирів),
     "carbs": число (грами вуглеводів),
+    "sugar": число (грами цукру - включаючи природний цукор з фруктів та доданий цукор),
     "fiber": число (грами клітковини),
     "portion_size": "оцінка розміру порції",
     "health_notes": "короткий коментар про користь/шкоду",
@@ -165,7 +170,8 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None) -> di
 Обов'язково врахуй цю інформацію при аналізі! Наприклад:
 - Якщо вказано спосіб приготування (смажене, варене, печене) — врахуй це для калорій
 - Якщо вказано вагу порції — використай її замість візуальної оцінки
-- Якщо вказано інгредієнти — врахуй їх у підрахунку"""
+- Якщо вказано інгредієнти — врахуй їх у підрахунку
+- Якщо вказано "без цукру" — постав sugar: 0"""
 
     try:
         async with httpx.AsyncClient() as client:
@@ -233,7 +239,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📸 *Як користуватися:*
 Надсилай мені фото своєї їжі, і я:
 • Розпізнаю що це за страва
-• Порахую калорії та БЖУ
+• Порахую калорії, БЖУ та цукор
 • Збережу в твою статистику
 
 💡 *Підказка:* Можеш додати підпис до фото!
@@ -262,15 +268,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • "порція 300г" — використаю твою вагу
 • "курка, рис, овочі" — уточню інгредієнти
 
-📊 *Статистика:*
+📊 *Що я рахую:*
+🔥 Калорії
+🥩 Білки
+🧈 Жири
+🍞 Вуглеводи
+🍬 Цукор
+🥬 Клітковина
+
+📈 *Статистика:*
 /today — що ти їв сьогодні
 /week — статистика за 7 днів
 /month — статистика за 30 днів
-
-⚙️ *Поради:*
-• Фотографуй їжу зверху для кращого розпізнавання
-• Намагайся захопити всю порцію в кадр
-• Додавай коментарі для точнішого підрахунку
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -291,6 +300,7 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🥩 Білки: {stats['protein']} г
 🧈 Жири: {stats['fat']} г
 🍞 Вуглеводи: {stats['carbs']} г
+🍬 Цукор: {stats['sugar']} г
 🥬 Клітковина: {stats['fiber']} г
 
 🍽 Прийомів їжі: {stats['meal_count']}
@@ -309,6 +319,7 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     avg_calories = round(stats["calories"] / 7)
+    avg_sugar = round(stats["sugar"] / 7, 1)
     
     text = f"""
 📊 *Статистика за тиждень*
@@ -319,6 +330,7 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🥩 Білки: {stats['protein']} г
 🧈 Жири: {stats['fat']} г  
 🍞 Вуглеводи: {stats['carbs']} г
+🍬 Цукор: {stats['sugar']} г (≈{avg_sugar} г/день)
 🥬 Клітковина: {stats['fiber']} г
 
 🍽 Прийомів їжі: {stats['meal_count']}
@@ -334,6 +346,7 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     avg_calories = round(stats["calories"] / 30)
+    avg_sugar = round(stats["sugar"] / 30, 1)
     
     text = f"""
 📊 *Статистика за місяць*
@@ -344,6 +357,7 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🥩 Білки: {stats['protein']} г
 🧈 Жири: {stats['fat']} г
 🍞 Вуглеводи: {stats['carbs']} г
+🍬 Цукор: {stats['sugar']} г (≈{avg_sugar} г/день)
 🥬 Клітковина: {stats['fiber']} г
 
 🍽 Прийомів їжі: {stats['meal_count']}
@@ -392,6 +406,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🥩 Білки: {result.get('protein', 0)} г
 🧈 Жири: {result.get('fat', 0)} г
 🍞 Вуглеводи: {result.get('carbs', 0)} г
+🍬 Цукор: {result.get('sugar', 0)} г
 🥬 Клітковина: {result.get('fiber', 0)} г
 
 📏 Порція: {result.get('portion_size', 'не визначено')}
@@ -433,9 +448,6 @@ def main():
     
     print("🤖 Бот запущено!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
