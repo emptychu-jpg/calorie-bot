@@ -1,7 +1,8 @@
 """
-🍎 Калорій Трекер Бот v2.0
+🍎 Калорій Трекер Бот v3.0
 Telegram бот для відстеження харчування з аналізом фото їжі через Claude AI
-+ Профіль користувача, цілі, персоналізовані поради
++ Профіль, цілі, персоналізовані поради
++ Кнопка видалення, трекінг активності, вечірні звіти
 """
 
 import os
@@ -9,13 +10,15 @@ import json
 import sqlite3
 import base64
 import httpx
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+import re
+from datetime import datetime, time
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -24,7 +27,7 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ТВІЙ_TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "ТВІЙ_ANTHROPIC_API_KEY")
 
-# Стани для ConversationHandler (створення профілю)
+# Стани для ConversationHandler
 GENDER, AGE, WEIGHT, HEIGHT, ACTIVITY, GOAL = range(6)
 
 # ============== БАЗА ДАНИХ ==============
@@ -66,6 +69,8 @@ def init_database():
             daily_fat INTEGER,
             daily_carbs INTEGER,
             daily_sugar INTEGER,
+            notifications_enabled BOOLEAN DEFAULT 1,
+            notification_time TEXT DEFAULT '21:00',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             profile_complete BOOLEAN DEFAULT 0
         )
@@ -78,9 +83,9 @@ def init_database():
             user_id INTEGER NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             activity_type TEXT,
-            duration_minutes INTEGER,
-            steps INTEGER,
-            calories_burned INTEGER,
+            duration_minutes INTEGER DEFAULT 0,
+            steps INTEGER DEFAULT 0,
+            calories_burned INTEGER DEFAULT 0,
             description TEXT
         )
     """)
@@ -89,14 +94,14 @@ def init_database():
     conn.close()
 
 def get_user_profile(user_id: int) -> dict:
-    """Отримує профіль користувача"""
     conn = sqlite3.connect("food_tracker.db")
     cursor = conn.cursor()
     
     cursor.execute("""
         SELECT user_id, first_name, gender, age, weight, height, 
                activity_level, goal, daily_calories, daily_protein,
-               daily_fat, daily_carbs, daily_sugar, profile_complete
+               daily_fat, daily_carbs, daily_sugar, profile_complete,
+               notifications_enabled
         FROM users WHERE user_id = ?
     """, (user_id,))
     
@@ -118,20 +123,21 @@ def get_user_profile(user_id: int) -> dict:
             "daily_fat": row[10],
             "daily_carbs": row[11],
             "daily_sugar": row[12],
-            "profile_complete": row[13]
+            "profile_complete": row[13],
+            "notifications_enabled": row[14]
         }
     return None
 
 def save_user_profile(user_id: int, profile: dict):
-    """Зберігає профіль користувача"""
     conn = sqlite3.connect("food_tracker.db")
     cursor = conn.cursor()
     
     cursor.execute("""
         INSERT OR REPLACE INTO users 
         (user_id, first_name, gender, age, weight, height, activity_level, goal,
-         daily_calories, daily_protein, daily_fat, daily_carbs, daily_sugar, profile_complete)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         daily_calories, daily_protein, daily_fat, daily_carbs, daily_sugar, 
+         profile_complete, notifications_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         profile.get("first_name"),
@@ -146,7 +152,8 @@ def save_user_profile(user_id: int, profile: dict):
         profile.get("daily_fat"),
         profile.get("daily_carbs"),
         profile.get("daily_sugar"),
-        profile.get("profile_complete", 1)
+        profile.get("profile_complete", 1),
+        profile.get("notifications_enabled", 1)
     ))
     
     conn.commit()
@@ -154,37 +161,32 @@ def save_user_profile(user_id: int, profile: dict):
 
 def calculate_daily_goals(gender: str, age: int, weight: float, height: float, 
                           activity_level: str, goal: str) -> dict:
-    """Розраховує денну норму КБЖУ за формулою Міффліна-Сан Жеора"""
-    
-    # Базовий метаболізм (BMR)
+    # Базовий метаболізм (BMR) за Міффліном-Сан Жеором
     if gender == "чоловік":
         bmr = 10 * weight + 6.25 * height - 5 * age + 5
     else:
         bmr = 10 * weight + 6.25 * height - 5 * age - 161
     
-    # Коефіцієнт активності
     activity_multipliers = {
-        "мінімальна": 1.2,      # сидячий спосіб життя
-        "низька": 1.375,        # легкі тренування 1-3 рази на тиждень
-        "середня": 1.55,        # тренування 3-5 разів на тиждень
-        "висока": 1.725,        # інтенсивні тренування 6-7 разів на тиждень
-        "дуже висока": 1.9      # фізична робота + тренування
+        "мінімальна": 1.2,
+        "низька": 1.375,
+        "середня": 1.55,
+        "висока": 1.725,
+        "дуже висока": 1.9
     }
     
     multiplier = activity_multipliers.get(activity_level, 1.55)
     maintenance_calories = bmr * multiplier
     
-    # Корекція під ціль
     if goal == "схуднення":
-        daily_calories = maintenance_calories - 500  # дефіцит 500 ккал
+        daily_calories = maintenance_calories - 500
     elif goal == "набір маси":
-        daily_calories = maintenance_calories + 300  # профіцит 300 ккал
-    else:  # підтримка
+        daily_calories = maintenance_calories + 300
+    else:
         daily_calories = maintenance_calories
     
     daily_calories = round(daily_calories)
     
-    # Розрахунок БЖУ
     if goal == "набір маси":
         protein_ratio, fat_ratio, carbs_ratio = 0.25, 0.25, 0.50
     elif goal == "схуднення":
@@ -192,10 +194,10 @@ def calculate_daily_goals(gender: str, age: int, weight: float, height: float,
     else:
         protein_ratio, fat_ratio, carbs_ratio = 0.25, 0.30, 0.45
     
-    daily_protein = round((daily_calories * protein_ratio) / 4)  # 4 ккал на грам
-    daily_fat = round((daily_calories * fat_ratio) / 9)          # 9 ккал на грам
-    daily_carbs = round((daily_calories * carbs_ratio) / 4)      # 4 ккал на грам
-    daily_sugar = round(daily_calories * 0.05 / 4)               # макс 5% від калорій
+    daily_protein = round((daily_calories * protein_ratio) / 4)
+    daily_fat = round((daily_calories * fat_ratio) / 9)
+    daily_carbs = round((daily_calories * carbs_ratio) / 4)
+    daily_sugar = round(daily_calories * 0.05 / 4)
     
     return {
         "daily_calories": daily_calories,
@@ -205,7 +207,8 @@ def calculate_daily_goals(gender: str, age: int, weight: float, height: float,
         "daily_sugar": daily_sugar
     }
 
-def save_meal(user_id: int, meal_data: dict):
+def save_meal(user_id: int, meal_data: dict) -> int:
+    """Зберігає їжу і повертає ID запису"""
     conn = sqlite3.connect("food_tracker.db")
     cursor = conn.cursor()
     
@@ -225,8 +228,81 @@ def save_meal(user_id: int, meal_data: dict):
         meal_data.get("photo_description", "")
     ))
     
+    meal_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    
+    return meal_id
+
+def delete_meal(meal_id: int, user_id: int) -> bool:
+    """Видаляє запис їжі. Повертає True якщо успішно."""
+    conn = sqlite3.connect("food_tracker.db")
+    cursor = conn.cursor()
+    
+    # Перевіряємо що запис належить цьому користувачу
+    cursor.execute("SELECT id FROM meals WHERE id = ? AND user_id = ?", (meal_id, user_id))
+    if not cursor.fetchone():
+        conn.close()
+        return False
+    
+    cursor.execute("DELETE FROM meals WHERE id = ? AND user_id = ?", (meal_id, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_meal_by_id(meal_id: int) -> dict:
+    """Отримує запис їжі за ID"""
+    conn = sqlite3.connect("food_tracker.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT id, food_name, calories FROM meals WHERE id = ?
+    """, (meal_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return {"id": row[0], "food_name": row[1], "calories": row[2]}
+    return None
+
+def save_activity(user_id: int, activity_data: dict) -> int:
+    """Зберігає активність і повертає ID"""
+    conn = sqlite3.connect("food_tracker.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO activities (user_id, activity_type, duration_minutes, steps, calories_burned, description)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        activity_data.get("activity_type", ""),
+        activity_data.get("duration_minutes", 0),
+        activity_data.get("steps", 0),
+        activity_data.get("calories_burned", 0),
+        activity_data.get("description", "")
+    ))
+    
+    activity_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return activity_id
+
+def delete_activity(activity_id: int, user_id: int) -> bool:
+    """Видаляє запис активності"""
+    conn = sqlite3.connect("food_tracker.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id FROM activities WHERE id = ? AND user_id = ?", (activity_id, user_id))
+    if not cursor.fetchone():
+        conn.close()
+        return False
+    
+    cursor.execute("DELETE FROM activities WHERE id = ? AND user_id = ?", (activity_id, user_id))
+    conn.commit()
+    conn.close()
+    return True
 
 def register_user(user_id: int, first_name: str):
     conn = sqlite3.connect("food_tracker.db")
@@ -244,6 +320,7 @@ def get_stats(user_id: int, days: int = 1) -> dict:
     else:
         date_filter = f"timestamp >= datetime('now', '-{days} days', 'localtime')"
     
+    # Статистика їжі
     cursor.execute(f"""
         SELECT 
             COUNT(*) as meal_count,
@@ -260,7 +337,7 @@ def get_stats(user_id: int, days: int = 1) -> dict:
     row = cursor.fetchone()
     
     cursor.execute(f"""
-        SELECT food_name, calories, timestamp
+        SELECT id, food_name, calories, timestamp
         FROM meals 
         WHERE user_id = ? AND {date_filter}
         ORDER BY timestamp DESC
@@ -268,6 +345,28 @@ def get_stats(user_id: int, days: int = 1) -> dict:
     """, (user_id,))
     
     meals = cursor.fetchall()
+    
+    # Статистика активностей
+    cursor.execute(f"""
+        SELECT 
+            COALESCE(SUM(calories_burned), 0) as total_burned,
+            COALESCE(SUM(steps), 0) as total_steps,
+            COALESCE(SUM(duration_minutes), 0) as total_duration
+        FROM activities 
+        WHERE user_id = ? AND {date_filter}
+    """, (user_id,))
+    
+    activity_row = cursor.fetchone()
+    
+    cursor.execute(f"""
+        SELECT id, activity_type, calories_burned, steps, duration_minutes, description
+        FROM activities 
+        WHERE user_id = ? AND {date_filter}
+        ORDER BY timestamp DESC
+    """, (user_id,))
+    
+    activities = cursor.fetchall()
+    
     conn.close()
     
     return {
@@ -279,14 +378,153 @@ def get_stats(user_id: int, days: int = 1) -> dict:
         "sugar": round(row[5], 1),
         "fiber": round(row[6], 1),
         "meals": meals,
-        "days": days
+        "days": days,
+        "calories_burned": activity_row[0],
+        "total_steps": activity_row[1],
+        "total_activity_minutes": activity_row[2],
+        "activities": activities
     }
+
+def get_users_for_notification() -> list:
+    """Отримує список користувачів для вечірнього звіту"""
+    conn = sqlite3.connect("food_tracker.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT user_id FROM users 
+        WHERE notifications_enabled = 1 AND profile_complete = 1
+    """)
+    
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+def toggle_notifications(user_id: int, enabled: bool):
+    """Вмикає/вимикає сповіщення"""
+    conn = sqlite3.connect("food_tracker.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET notifications_enabled = ? WHERE user_id = ?", (enabled, user_id))
+    conn.commit()
+    conn.close()
+
+# ============== АНАЛІЗ АКТИВНОСТІ ==============
+def parse_activity(text: str, user_profile: dict = None) -> dict:
+    """Розпізнає активність з тексту і рахує спалені калорії"""
+    text_lower = text.lower()
+    
+    # Вага користувача (для розрахунку калорій)
+    weight = 70  # за замовчуванням
+    if user_profile and user_profile.get("weight"):
+        weight = user_profile["weight"]
+    
+    result = {
+        "activity_type": "",
+        "duration_minutes": 0,
+        "steps": 0,
+        "calories_burned": 0,
+        "description": text
+    }
+    
+    # Розпізнавання кроків
+    steps_match = re.search(r'(\d+)\s*(?:кроків|кроки|крок|steps|к\.)', text_lower)
+    if steps_match:
+        steps = int(steps_match.group(1))
+        result["steps"] = steps
+        result["activity_type"] = "кроки"
+        # Приблизно 0.04 ккал на крок для людини 70 кг
+        result["calories_burned"] = round(steps * 0.04 * (weight / 70))
+        return result
+    
+    # Розпізнавання часу
+    duration = 0
+    time_match = re.search(r'(\d+)\s*(?:хв|хвилин|минут|мін|min|m)', text_lower)
+    if time_match:
+        duration = int(time_match.group(1))
+    
+    hour_match = re.search(r'(\d+)\s*(?:год|година|години|годин|hour|h)', text_lower)
+    if hour_match:
+        duration += int(hour_match.group(1)) * 60
+    
+    result["duration_minutes"] = duration
+    
+    # MET значення для різних активностей (метаболічний еквівалент)
+    activities = {
+        "біг": 9.8,
+        "пробіж": 9.8,
+        "running": 9.8,
+        "run": 9.8,
+        "бігав": 9.8,
+        "бігала": 9.8,
+        
+        "ходьба": 3.8,
+        "прогулянка": 3.8,
+        "гуляла": 3.8,
+        "гуляв": 3.8,
+        "walk": 3.8,
+        "walking": 3.8,
+        
+        "велосипед": 7.5,
+        "велик": 7.5,
+        "cycling": 7.5,
+        "bike": 7.5,
+        
+        "плавання": 6.0,
+        "плавала": 6.0,
+        "плавав": 6.0,
+        "swim": 6.0,
+        "басейн": 6.0,
+        
+        "тренування": 6.0,
+        "тренажерка": 6.0,
+        "зал": 6.0,
+        "gym": 6.0,
+        "workout": 6.0,
+        "фітнес": 5.5,
+        "fitness": 5.5,
+        
+        "йога": 3.0,
+        "yoga": 3.0,
+        "розтяжка": 2.5,
+        "stretch": 2.5,
+        
+        "танці": 5.0,
+        "dance": 5.0,
+        "танцювала": 5.0,
+        "танцював": 5.0,
+        
+        "футбол": 7.0,
+        "баскетбол": 6.5,
+        "волейбол": 4.0,
+        "теніс": 7.0,
+        
+        "прибирання": 3.5,
+        "домашні справи": 3.0,
+        
+        "сходи": 8.0,
+        "stairs": 8.0,
+    }
+    
+    # Шукаємо активність у тексті
+    met_value = 5.0  # за замовчуванням — помірна активність
+    for activity, met in activities.items():
+        if activity in text_lower:
+            result["activity_type"] = activity
+            met_value = met
+            break
+    
+    if not result["activity_type"]:
+        result["activity_type"] = "активність"
+    
+    # Розрахунок калорій: MET * вага(кг) * час(год)
+    if duration > 0:
+        result["calories_burned"] = round(met_value * weight * (duration / 60))
+    
+    return result
 
 # ============== АНАЛІЗ ФОТО ЧЕРЕЗ CLAUDE API ==============
 async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None, user_profile: dict = None) -> dict:
     base64_image = base64.standard_b64encode(photo_bytes).decode("utf-8")
     
-    # Базовий промпт
     prompt = """Проаналізуй це фото їжі та дай оцінку українською мовою.
 
 Відповідь ОБОВ'ЯЗКОВО у форматі JSON (без markdown, тільки чистий JSON):
@@ -309,7 +547,6 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None, user_
 
 Будь точним у підрахунку, враховуй видимий розмір порції."""
 
-    # Додаємо персоналізацію якщо є профіль
     if user_profile and user_profile.get("profile_complete"):
         goal_text = {
             "схуднення": "схуднути (потрібен дефіцит калорій, більше білка)",
@@ -319,19 +556,15 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None, user_
         
         prompt += f"""
 
-ПРОФІЛЬ КОРИСТУВАЧА (обов'язково враховуй для персоналізованої поради):
+ПРОФІЛЬ КОРИСТУВАЧА:
 - Стать: {user_profile.get('gender')}
 - Вік: {user_profile.get('age')} років
 - Вага: {user_profile.get('weight')} кг
-- Зріст: {user_profile.get('height')} см
-- Рівень активності: {user_profile.get('activity_level')}
 - Ціль: {goal_text}
-- Денна норма: {user_profile.get('daily_calories')} ккал, {user_profile.get('daily_protein')}г білка
+- Денна норма: {user_profile.get('daily_calories')} ккал
 
-В полі "personalized_tip" дай пораду саме для цієї людини з урахуванням її цілі!
-Наприклад: "Для схуднення ця страва підходить, але краще зменшити порцію" або "Чудовий вибір для набору маси — багато білка!"."""
+В полі "personalized_tip" дай пораду саме для цієї людини!"""
 
-    # Додаємо коментар користувача якщо є
     if user_comment:
         prompt += f"""
 
@@ -362,10 +595,7 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None, user_
                                         "data": base64_image,
                                     },
                                 },
-                                {
-                                    "type": "text",
-                                    "text": prompt
-                                }
+                                {"type": "text", "text": prompt}
                             ],
                         }
                     ],
@@ -390,15 +620,49 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None, user_
     except Exception as e:
         return {"error": f"Помилка аналізу: {str(e)}"}
 
+# ============== CALLBACK HANDLERS (кнопки) ==============
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка натискання inline кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user_id = query.from_user.id
+    
+    # Видалення їжі
+    if data.startswith("delete_meal_"):
+        meal_id = int(data.replace("delete_meal_", ""))
+        meal = get_meal_by_id(meal_id)
+        
+        if meal and delete_meal(meal_id, user_id):
+            await query.edit_message_text(
+                f"🗑 *Видалено:* {meal['food_name']} ({meal['calories']} ккал)\n\n"
+                f"Запис успішно видалено з статистики.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text("❌ Не вдалося видалити запис.")
+    
+    # Видалення активності
+    elif data.startswith("delete_activity_"):
+        activity_id = int(data.replace("delete_activity_", ""))
+        
+        if delete_activity(activity_id, user_id):
+            await query.edit_message_text(
+                "🗑 Активність видалено з статистики.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text("❌ Не вдалося видалити запис.")
+
 # ============== КОМАНДИ ПРОФІЛЮ ==============
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показує профіль або пропонує створити"""
     user = update.effective_user
     profile = get_user_profile(user.id)
     
     if profile and profile.get("profile_complete"):
-        # Показуємо існуючий профіль
         goal_emoji = {"схуднення": "🔥", "набір маси": "💪", "підтримка": "⚖️"}.get(profile["goal"], "")
+        notif_status = "✅ Увімкнено" if profile.get("notifications_enabled") else "❌ Вимкнено"
         
         text = f"""
 👤 *Твій профіль*
@@ -419,61 +683,54 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🍞 Вуглеводи: {profile['daily_carbs']} г
 🍬 Цукор: до {profile['daily_sugar']} г
 
+🔔 *Вечірні звіти:* {notif_status}
+
 ✏️ /editprofile — змінити профіль
+🔔 /notifications — налаштувати сповіщення
 """
         await update.message.reply_text(text, parse_mode="Markdown")
     else:
-        # Пропонуємо створити
         await update.message.reply_text(
             "👤 У тебе ще немає профілю!\n\n"
-            "Створи його, щоб отримувати персоналізовані поради та відстежувати прогрес до своєї цілі.\n\n"
-            "Натисни /newprofile щоб почати 📝"
+            "Натисни /newprofile щоб створити 📝"
         )
 
 async def new_profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Початок створення профілю"""
     keyboard = [["Чоловік 👨", "Жінка 👩"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     
     await update.message.reply_text(
-        "📝 *Створення профілю*\n\n"
-        "Крок 1/6: Обери стать:",
+        "📝 *Створення профілю*\n\nКрок 1/6: Обери стать:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
     return GENDER
 
 async def profile_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка статі"""
     text = update.message.text.lower()
-    if "чоловік" in text:
-        context.user_data["gender"] = "чоловік"
-    else:
-        context.user_data["gender"] = "жінка"
+    context.user_data["gender"] = "чоловік" if "чоловік" in text else "жінка"
     
     await update.message.reply_text(
-        "Крок 2/6: Введи свій вік (число):",
+        "Крок 2/6: Введи свій вік:",
         reply_markup=ReplyKeyboardRemove()
     )
     return AGE
 
 async def profile_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка віку"""
     try:
         age = int(update.message.text)
         if age < 10 or age > 120:
-            await update.message.reply_text("❌ Введи реальний вік (10-120 років):")
+            await update.message.reply_text("❌ Введи реальний вік (10-120):")
             return AGE
         context.user_data["age"] = age
     except ValueError:
-        await update.message.reply_text("❌ Введи число! Наприклад: 25")
+        await update.message.reply_text("❌ Введи число!")
         return AGE
     
-    await update.message.reply_text("Крок 3/6: Введи свою вагу в кг (наприклад: 70):")
+    await update.message.reply_text("Крок 3/6: Введи вагу в кг:")
     return WEIGHT
 
 async def profile_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка ваги"""
     try:
         weight = float(update.message.text.replace(",", "."))
         if weight < 30 or weight > 300:
@@ -481,14 +738,13 @@ async def profile_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return WEIGHT
         context.user_data["weight"] = weight
     except ValueError:
-        await update.message.reply_text("❌ Введи число! Наприклад: 70")
+        await update.message.reply_text("❌ Введи число!")
         return WEIGHT
     
-    await update.message.reply_text("Крок 4/6: Введи свій зріст в см (наприклад: 175):")
+    await update.message.reply_text("Крок 4/6: Введи зріст в см:")
     return HEIGHT
 
 async def profile_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка зросту"""
     try:
         height = float(update.message.text.replace(",", "."))
         if height < 100 or height > 250:
@@ -496,64 +752,53 @@ async def profile_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return HEIGHT
         context.user_data["height"] = height
     except ValueError:
-        await update.message.reply_text("❌ Введи число! Наприклад: 175")
+        await update.message.reply_text("❌ Введи число!")
         return HEIGHT
     
     keyboard = [
-        ["Мінімальна 🪑"],
-        ["Низька 🚶"],
-        ["Середня 🏃"],
-        ["Висока 💪"],
-        ["Дуже висока 🔥"]
+        ["Мінімальна 🪑"], ["Низька 🚶"], ["Середня 🏃"], 
+        ["Висока 💪"], ["Дуже висока 🔥"]
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     
     await update.message.reply_text(
-        "Крок 5/6: Обери рівень активності:\n\n"
-        "🪑 *Мінімальна* — сидяча робота, без тренувань\n"
-        "🚶 *Низька* — легкі тренування 1-3 рази на тиждень\n"
-        "🏃 *Середня* — тренування 3-5 разів на тиждень\n"
-        "💪 *Висока* — інтенсивні тренування 6-7 разів на тиждень\n"
-        "🔥 *Дуже висока* — фізична робота + тренування",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        "Крок 5/6: Рівень активності:\n\n"
+        "🪑 Мінімальна — сидяча робота\n"
+        "🚶 Низька — 1-3 тренування/тиждень\n"
+        "🏃 Середня — 3-5 тренувань/тиждень\n"
+        "💪 Висока — 6-7 тренувань/тиждень\n"
+        "🔥 Дуже висока — фізична робота + спорт",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     )
     return ACTIVITY
 
 async def profile_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка активності"""
     text = update.message.text.lower()
     
-    if "мінімальна" in text:
-        activity = "мінімальна"
-    elif "низька" in text:
-        activity = "низька"
-    elif "середня" in text:
-        activity = "середня"
-    elif "дуже висока" in text:
-        activity = "дуже висока"
-    elif "висока" in text:
-        activity = "висока"
-    else:
-        activity = "середня"
+    activity_map = {
+        "мінімальна": "мінімальна",
+        "низька": "низька", 
+        "середня": "середня",
+        "дуже висока": "дуже висока",
+        "висока": "висока"
+    }
+    
+    activity = "середня"
+    for key, value in activity_map.items():
+        if key in text:
+            activity = value
+            break
     
     context.user_data["activity_level"] = activity
     
-    keyboard = [
-        ["Схуднення 🔥"],
-        ["Набір маси 💪"],
-        ["Підтримка ваги ⚖️"]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    keyboard = [["Схуднення 🔥"], ["Набір маси 💪"], ["Підтримка ваги ⚖️"]]
     
     await update.message.reply_text(
         "Крок 6/6: Яка твоя ціль?",
-        reply_markup=reply_markup
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     )
     return GOAL
 
 async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершення створення профілю"""
     text = update.message.text.lower()
     
     if "схуднення" in text:
@@ -563,9 +808,6 @@ async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         goal = "підтримка"
     
-    context.user_data["goal"] = goal
-    
-    # Розраховуємо денну норму
     daily_goals = calculate_daily_goals(
         context.user_data["gender"],
         context.user_data["age"],
@@ -575,7 +817,6 @@ async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         goal
     )
     
-    # Зберігаємо профіль
     user = update.effective_user
     profile = {
         "first_name": user.first_name,
@@ -586,6 +827,7 @@ async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "activity_level": context.user_data["activity_level"],
         "goal": goal,
         "profile_complete": 1,
+        "notifications_enabled": 1,
         **daily_goals
     }
     
@@ -595,15 +837,14 @@ async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"✅ *Профіль створено!*\n\n"
-        f"🎯 Твоя ціль: {goal_emoji} {goal}\n\n"
-        f"📈 *Твоя денна норма:*\n"
+        f"🎯 Ціль: {goal_emoji} {goal}\n\n"
+        f"📈 *Денна норма:*\n"
         f"🔥 Калорії: *{daily_goals['daily_calories']}* ккал\n"
         f"🥩 Білки: {daily_goals['daily_protein']} г\n"
         f"🧈 Жири: {daily_goals['daily_fat']} г\n"
-        f"🍞 Вуглеводи: {daily_goals['daily_carbs']} г\n"
-        f"🍬 Цукор: до {daily_goals['daily_sugar']} г\n\n"
-        f"Тепер я буду давати персоналізовані поради! 🎯\n\n"
-        f"📸 Надішли фото їжі, щоб почати трекінг!",
+        f"🍞 Вуглеводи: {daily_goals['daily_carbs']} г\n\n"
+        f"🔔 Вечірні звіти увімкнено (21:00)\n\n"
+        f"📸 Надішли фото їжі, щоб почати!",
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="Markdown"
     )
@@ -611,13 +852,120 @@ async def profile_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def profile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Скасування створення профілю"""
     await update.message.reply_text(
-        "❌ Створення профілю скасовано.\n"
-        "Можеш почати знову: /newprofile",
+        "❌ Скасовано. /newprofile щоб почати знову.",
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
+
+# ============== СПОВІЩЕННЯ ==============
+async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Налаштування сповіщень"""
+    user_id = update.effective_user.id
+    profile = get_user_profile(user_id)
+    
+    if not profile:
+        await update.message.reply_text("Спочатку створи профіль: /newprofile")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Увімкнути", callback_data="notif_on"),
+         InlineKeyboardButton("❌ Вимкнути", callback_data="notif_off")]
+    ]
+    
+    current = "✅ Увімкнено" if profile.get("notifications_enabled") else "❌ Вимкнено"
+    
+    await update.message.reply_text(
+        f"🔔 *Вечірні звіти*\n\n"
+        f"Щодня о 21:00 я надсилатиму підсумок дня.\n\n"
+        f"Поточний статус: {current}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def notification_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка кнопок сповіщень"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data == "notif_on":
+        toggle_notifications(user_id, True)
+        await query.edit_message_text("🔔 Вечірні звіти *увімкнено*!\n\nЩодня о 21:00 отримуватимеш підсумок дня.", parse_mode="Markdown")
+    elif query.data == "notif_off":
+        toggle_notifications(user_id, False)
+        await query.edit_message_text("🔕 Вечірні звіти *вимкнено*.\n\n/notifications щоб увімкнути знову.", parse_mode="Markdown")
+
+# ============== ВЕЧІРНІЙ ЗВІТ ==============
+async def send_evening_report(context: ContextTypes.DEFAULT_TYPE):
+    """Надсилає вечірній звіт всім користувачам"""
+    users = get_users_for_notification()
+    
+    for user_id in users:
+        try:
+            stats = get_stats(user_id, days=1)
+            profile = get_user_profile(user_id)
+            
+            if not profile:
+                continue
+            
+            # Формуємо звіт
+            cal_goal = profile.get("daily_calories", 2000)
+            cal_eaten = stats["calories"]
+            cal_burned = stats.get("calories_burned", 0)
+            net_calories = cal_eaten - cal_burned
+            cal_left = cal_goal - net_calories
+            
+            # Прогрес
+            percent = min(100, round(net_calories / cal_goal * 100)) if cal_goal > 0 else 0
+            filled = int(percent / 10)
+            bar = "▓" * filled + "░" * (10 - filled)
+            
+            if stats["meal_count"] == 0:
+                text = (
+                    "🌙 *Вечірній звіт*\n\n"
+                    "📭 Сьогодні ти нічого не записував.\n\n"
+                    "Не забувай фотографувати їжу! 📸"
+                )
+            else:
+                if cal_left > 0:
+                    verdict = f"✅ Залишилось {cal_left} ккал"
+                elif cal_left > -200:
+                    verdict = f"⚠️ Трохи перевищено ({abs(cal_left)} ккал)"
+                else:
+                    verdict = f"🔴 Перевищено на {abs(cal_left)} ккал"
+                
+                text = f"""
+🌙 *Вечірній звіт*
+
+📊 *Сьогодні:*
+🍽 Прийомів їжі: {stats['meal_count']}
+🔥 Спожито: {cal_eaten} ккал
+"""
+                
+                if cal_burned > 0:
+                    text += f"💪 Спалено: {cal_burned} ккал\n"
+                    text += f"📊 Нетто: {net_calories} ккал\n"
+                
+                if stats.get("total_steps", 0) > 0:
+                    text += f"👟 Кроків: {stats['total_steps']}\n"
+                
+                text += f"""
+━━━━━━━━━━━━
+🎯 *Прогрес:*
+[{bar}] {percent}%
+{verdict}
+
+Ціль: {cal_goal} ккал ({profile.get('goal', 'підтримка')})
+
+Гарного відпочинку! 😴
+"""
+            
+            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
+            
+        except Exception as e:
+            print(f"Error sending report to {user_id}: {e}")
 
 # ============== ОСНОВНІ КОМАНДИ ==============
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -628,24 +976,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = f"""
 👋 Привіт, {user.first_name}!
 
-Я твій персональний *Калорій Трекер* 🍎
+Я твій *Калорій Трекер* 🍎
 
-📸 *Як користуватися:*
-Надсилай мені фото своєї їжі, і я:
-• Розпізнаю страву та порахую КБЖУ
-• Дам персоналізовані поради
-• Покажу прогрес до твоєї цілі
+📸 *Їжа:* надсилай фото — я порахую калорії
+🏃 *Активність:* пиши текстом — "пробіжка 30 хв" або "8000 кроків"
 
 📊 *Команди:*
 /today — статистика за сьогодні
-/week — статистика за тиждень
-/month — статистика за місяць
 /profile — твій профіль
+/notifications — налаштувати звіти
 /help — допомога
 """
     
     if not profile or not profile.get("profile_complete"):
-        welcome_text += "\n\n⚡ *Рекомендую почати з профілю:* /newprofile"
+        welcome_text += "\n⚡ *Почни з профілю:* /newprofile"
     
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -653,24 +997,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🍎 *Калорій Трекер — Допомога*
 
-📸 *Трекінг їжі:*
-Сфотографуй їжу та надішли мені.
-Можеш додати підпис: "смажене", "300г", "без цукру"
+📸 *Їжа:*
+Надішли фото — я проаналізую.
+Можеш додати підпис: "300г", "без цукру"
+
+🏃 *Активність:*
+Напиши текстом, наприклад:
+• "пробіжка 30 хв"
+• "10000 кроків"  
+• "тренування в залі 1 година"
+• "прогулянка 45 хвилин"
 
 👤 *Профіль:*
-/profile — переглянути профіль
-/newprofile — створити/оновити профіль
-/editprofile — змінити дані
+/profile — переглянути
+/newprofile — створити
+/editprofile — змінити
 
 📊 *Статистика:*
-/today — за сьогодні (з прогресом до цілі)
-/week — за тиждень
-/month — за місяць
+/today — сьогодні
+/week — тиждень
+/month — місяць
 
-📈 *Що я рахую:*
-🔥 Калорії
-🥩 Білки, 🧈 Жири, 🍞 Вуглеводи
-🍬 Цукор, 🥬 Клітковина
+🔔 *Сповіщення:*
+/notifications — вечірні звіти
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -679,61 +1028,62 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = get_stats(user_id, days=1)
     profile = get_user_profile(user_id)
     
-    if stats["meal_count"] == 0:
+    if stats["meal_count"] == 0 and not stats.get("activities"):
         await update.message.reply_text(
-            "📭 Сьогодні ти ще нічого не їв!\n\n"
-            "Надішли фото їжі, щоб почати трекінг."
+            "📭 Сьогодні поки пусто!\n\n"
+            "📸 Надішли фото їжі\n"
+            "🏃 Або напиши про активність"
         )
         return
     
-    meals_list = "\n".join([f"  • {meal[0]} — {meal[1]} ккал" for meal in stats["meals"]])
+    text = "📊 *Статистика за сьогодні*\n\n"
     
-    # Базова статистика
-    text = f"""
-📊 *Статистика за сьогодні*
-
-🔥 Калорії: *{stats['calories']}* ккал
-🥩 Білки: {stats['protein']} г
-🧈 Жири: {stats['fat']} г
-🍞 Вуглеводи: {stats['carbs']} г
-🍬 Цукор: {stats['sugar']} г
-🥬 Клітковина: {stats['fiber']} г
-
-🍽 Прийомів їжі: {stats['meal_count']}
-"""
+    # Їжа
+    if stats["meal_count"] > 0:
+        text += f"🍽 *Їжа:*\n"
+        text += f"🔥 Спожито: *{stats['calories']}* ккал\n"
+        text += f"🥩 Б: {stats['protein']}г 🧈 Ж: {stats['fat']}г 🍞 В: {stats['carbs']}г\n"
+        text += f"🍬 Цукор: {stats['sugar']}г 🥬 Клітковина: {stats['fiber']}г\n\n"
     
-    # Додаємо прогрес якщо є профіль
+    # Активність
+    if stats.get("calories_burned", 0) > 0 or stats.get("total_steps", 0) > 0:
+        text += f"💪 *Активність:*\n"
+        if stats.get("total_steps", 0) > 0:
+            text += f"👟 Кроків: {stats['total_steps']}\n"
+        if stats.get("calories_burned", 0) > 0:
+            text += f"🔥 Спалено: {stats['calories_burned']} ккал\n"
+        if stats.get("total_activity_minutes", 0) > 0:
+            text += f"⏱ Час: {stats['total_activity_minutes']} хв\n"
+        text += "\n"
+    
+    # Прогрес
     if profile and profile.get("profile_complete"):
         cal_goal = profile["daily_calories"]
-        cal_left = cal_goal - stats["calories"]
-        cal_percent = min(100, round(stats["calories"] / cal_goal * 100))
+        cal_eaten = stats["calories"]
+        cal_burned = stats.get("calories_burned", 0)
+        net_calories = cal_eaten - cal_burned
+        cal_left = cal_goal - net_calories
         
-        # Прогрес-бар
-        filled = int(cal_percent / 10)
-        progress_bar = "▓" * filled + "░" * (10 - filled)
+        percent = min(100, round(net_calories / cal_goal * 100)) if cal_goal > 0 else 0
+        filled = int(percent / 10)
+        bar = "▓" * filled + "░" * (10 - filled)
+        
+        emoji = "🟢" if percent < 80 else ("🟡" if percent < 100 else "🔴")
+        
+        text += f"━━━━━━━━━━━━\n"
+        text += f"🎯 *Прогрес:*\n"
+        text += f"{emoji} [{bar}] {percent}%\n"
         
         if cal_left > 0:
-            progress_text = f"Залишилось: *{cal_left}* ккал"
-            emoji = "🟢" if cal_percent < 80 else "🟡"
+            text += f"Залишилось: *{cal_left}* ккал\n"
         else:
-            progress_text = f"Перевищено на: *{abs(cal_left)}* ккал"
-            emoji = "🔴"
-        
-        text += f"""
-━━━━━━━━━━━━━━━
-🎯 *Прогрес до цілі:*
-
-{emoji} [{progress_bar}] {cal_percent}%
-{progress_text}
-
-Ціль: {cal_goal} ккал ({profile['goal']})
-"""
+            text += f"Перевищено на: *{abs(cal_left)}* ккал\n"
     
-    text += f"""
-━━━━━━━━━━━━━━━
-📝 *Що ти їв:*
-{meals_list}
-"""
+    # Список їжі
+    if stats["meals"]:
+        text += f"\n📝 *Що їв:*\n"
+        for meal in stats["meals"][:5]:
+            text += f"• {meal[1]} — {meal[2]} ккал\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -743,40 +1093,42 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile = get_user_profile(user_id)
     
     if stats["meal_count"] == 0:
-        await update.message.reply_text("📭 За останній тиждень немає даних.")
+        await update.message.reply_text("📭 За тиждень немає даних.")
         return
     
-    avg_calories = round(stats["calories"] / 7)
-    avg_sugar = round(stats["sugar"] / 7, 1)
+    avg_cal = round(stats["calories"] / 7)
     
     text = f"""
 📊 *Статистика за тиждень*
 
-🔥 Всього калорій: *{stats['calories']}* ккал
-📈 В середньому на день: *{avg_calories}* ккал
+🔥 Всього: *{stats['calories']}* ккал
+📈 Середнє: *{avg_cal}* ккал/день
 
 🥩 Білки: {stats['protein']} г
 🧈 Жири: {stats['fat']} г
 🍞 Вуглеводи: {stats['carbs']} г
-🍬 Цукор: {stats['sugar']} г (≈{avg_sugar} г/день)
-🥬 Клітковина: {stats['fiber']} г
+🍬 Цукор: {stats['sugar']} г
 
 🍽 Прийомів їжі: {stats['meal_count']}
 """
     
-    # Порівняння з ціллю
+    if stats.get("calories_burned", 0) > 0:
+        text += f"\n💪 Спалено: {stats['calories_burned']} ккал"
+    if stats.get("total_steps", 0) > 0:
+        text += f"\n👟 Кроків: {stats['total_steps']}"
+    
     if profile and profile.get("profile_complete"):
-        cal_goal = profile["daily_calories"] * 7
-        diff = stats["calories"] - cal_goal
+        goal_week = profile["daily_calories"] * 7
+        diff = stats["calories"] - goal_week
         
-        if abs(diff) < cal_goal * 0.05:
-            verdict = "✅ Ти тримаєшся в межах норми!"
+        if abs(diff) < goal_week * 0.05:
+            verdict = "✅ В межах норми!"
         elif diff < 0:
-            verdict = f"🟢 Ти з'їв на {abs(diff)} ккал менше норми"
+            verdict = f"🟢 На {abs(diff)} ккал менше норми"
         else:
-            verdict = f"🟡 Ти перевищив норму на {diff} ккал"
+            verdict = f"🟡 На {diff} ккал більше норми"
         
-        text += f"\n🎯 *Ціль на тиждень:* {cal_goal} ккал\n{verdict}"
+        text += f"\n\n🎯 Ціль: {goal_week} ккал\n{verdict}"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -785,26 +1137,30 @@ async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = get_stats(user_id, days=30)
     
     if stats["meal_count"] == 0:
-        await update.message.reply_text("📭 За останній місяць немає даних.")
+        await update.message.reply_text("📭 За місяць немає даних.")
         return
     
-    avg_calories = round(stats["calories"] / 30)
-    avg_sugar = round(stats["sugar"] / 30, 1)
+    avg_cal = round(stats["calories"] / 30)
     
     text = f"""
 📊 *Статистика за місяць*
 
-🔥 Всього калорій: *{stats['calories']}* ккал
-📈 В середньому на день: *{avg_calories}* ккал
+🔥 Всього: *{stats['calories']}* ккал
+📈 Середнє: *{avg_cal}* ккал/день
 
 🥩 Білки: {stats['protein']} г
 🧈 Жири: {stats['fat']} г
 🍞 Вуглеводи: {stats['carbs']} г
-🍬 Цукор: {stats['sugar']} г (≈{avg_sugar} г/день)
-🥬 Клітковина: {stats['fiber']} г
+🍬 Цукор: {stats['sugar']} г
 
 🍽 Прийомів їжі: {stats['meal_count']}
 """
+    
+    if stats.get("calories_burned", 0) > 0:
+        text += f"\n💪 Спалено: {stats['calories_burned']} ккал"
+    if stats.get("total_steps", 0) > 0:
+        text += f"\n👟 Кроків: {stats['total_steps']}"
+    
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ============== ОБРОБКА ФОТО ==============
@@ -815,13 +1171,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_comment = update.message.caption
     profile = get_user_profile(user.id)
     
-    if user_comment:
-        processing_msg = await update.message.reply_text(
-            f"🔍 Аналізую фото з урахуванням: _{user_comment}_",
-            parse_mode="Markdown"
-        )
-    else:
-        processing_msg = await update.message.reply_text("🔍 Аналізую фото...")
+    processing_msg = await update.message.reply_text("🔍 Аналізую фото...")
     
     try:
         photo = update.message.photo[-1]
@@ -834,57 +1184,106 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await processing_msg.edit_text(f"❌ {result['error']}")
             return
         
-        save_meal(user.id, result)
+        meal_id = save_meal(user.id, result)
         
-        # Формуємо відповідь
+        # Відповідь
         response = f"""
 ✅ *Записано!*
 
 🍽 *{result.get('food_name', 'Страва')}*
 
 🔥 Калорії: *{result.get('calories', 0)}* ккал
-🥩 Білки: {result.get('protein', 0)} г
-🧈 Жири: {result.get('fat', 0)} г
-🍞 Вуглеводи: {result.get('carbs', 0)} г
-🍬 Цукор: {result.get('sugar', 0)} г
-🥬 Клітковина: {result.get('fiber', 0)} г
-
-📏 Порція: {result.get('portion_size', 'не визначено')}
+🥩 Б: {result.get('protein', 0)}г 🧈 Ж: {result.get('fat', 0)}г 🍞 В: {result.get('carbs', 0)}г
+🍬 Цукор: {result.get('sugar', 0)}г 🥬 Клітковина: {result.get('fiber', 0)}г
 """
         
-        # Додаємо персоналізовану пораду
         if result.get('personalized_tip'):
-            response += f"\n💡 *Порада для тебе:*\n_{result.get('personalized_tip')}_"
-        elif result.get('health_notes'):
-            response += f"\n💡 {result.get('health_notes')}"
+            response += f"\n💡 _{result.get('personalized_tip')}_"
         
-        # Додаємо прогрес за день якщо є профіль
+        # Прогрес
         if profile and profile.get("profile_complete"):
             stats = get_stats(user.id, days=1)
             cal_goal = profile["daily_calories"]
             cal_left = cal_goal - stats["calories"]
             
             if cal_left > 0:
-                response += f"\n\n📊 Сьогодні з'їдено: {stats['calories']}/{cal_goal} ккал\n🎯 Залишилось: *{cal_left}* ккал"
+                response += f"\n\n📊 {stats['calories']}/{cal_goal} ккал • Залишилось: *{cal_left}*"
             else:
-                response += f"\n\n📊 Сьогодні з'їдено: {stats['calories']}/{cal_goal} ккал\n⚠️ Перевищено на: *{abs(cal_left)}* ккал"
+                response += f"\n\n📊 {stats['calories']}/{cal_goal} ккал • ⚠️ +{abs(cal_left)}"
         
-        if user_comment:
-            response += f"\n\n📝 Враховано: _{user_comment}_"
+        # Кнопка видалення
+        keyboard = [[InlineKeyboardButton("🗑 Видалити", callback_data=f"delete_meal_{meal_id}")]]
         
-        await processing_msg.edit_text(response, parse_mode="Markdown")
+        await processing_msg.edit_text(
+            response, 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         
     except Exception as e:
-        await processing_msg.edit_text(f"❌ Помилка обробки: {str(e)}")
+        await processing_msg.edit_text(f"❌ Помилка: {str(e)}")
 
+# ============== ОБРОБКА ТЕКСТУ (активність) ==============
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.lower()
+    
+    # Перевіряємо чи це схоже на активність
+    activity_keywords = [
+        'крок', 'кроків', 'біг', 'пробіж', 'ходьба', 'прогулянка', 'гуля',
+        'велосипед', 'велик', 'плавання', 'плавав', 'плавала', 'басейн',
+        'тренування', 'тренажер', 'зал', 'gym', 'фітнес', 'йога',
+        'танці', 'танцював', 'танцювала', 'футбол', 'баскетбол',
+        'хвилин', 'хв', 'година', 'год', 'min', 'час'
+    ]
+    
+    is_activity = any(keyword in text for keyword in activity_keywords)
+    
+    if is_activity:
+        profile = get_user_profile(user.id)
+        activity = parse_activity(update.message.text, profile)
+        
+        if activity["calories_burned"] > 0 or activity["steps"] > 0:
+            activity_id = save_activity(user.id, activity)
+            
+            response = "💪 *Активність записано!*\n\n"
+            
+            if activity["steps"] > 0:
+                response += f"👟 Кроків: *{activity['steps']}*\n"
+            if activity["duration_minutes"] > 0:
+                response += f"⏱ Тривалість: {activity['duration_minutes']} хв\n"
+            if activity["activity_type"]:
+                response += f"🏃 Тип: {activity['activity_type']}\n"
+            
+            response += f"🔥 Спалено: *{activity['calories_burned']}* ккал"
+            
+            # Прогрес з урахуванням активності
+            if profile and profile.get("profile_complete"):
+                stats = get_stats(user.id, days=1)
+                cal_goal = profile["daily_calories"]
+                net = stats["calories"] - stats.get("calories_burned", 0)
+                cal_left = cal_goal - net
+                
+                response += f"\n\n📊 Нетто за день: {net} ккал"
+                if cal_left > 0:
+                    response += f" • Залишилось: *{cal_left}*"
+            
+            keyboard = [[InlineKeyboardButton("🗑 Видалити", callback_data=f"delete_activity_{activity_id}")]]
+            
+            await update.message.reply_text(
+                response,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+    
+    # Якщо не активність — стандартна відповідь
     await update.message.reply_text(
-        "📷 Надішли мені *фото їжі*, і я проаналізую його!\n\n"
-        "💡 Можеш додати підпис для уточнення\n\n"
-        "Або скористайся командами:\n"
-        "/today — статистика за сьогодні\n"
-        "/profile — твій профіль\n"
-        "/help — допомога",
+        "📷 Надішли *фото їжі* — я проаналізую\n\n"
+        "🏃 Або напиши про активність:\n"
+        "• «пробіжка 30 хв»\n"
+        "• «10000 кроків»\n"
+        "• «тренування 1 година»",
         parse_mode="Markdown"
     )
 
@@ -894,8 +1293,8 @@ def main():
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Обробник створення профілю
-    profile_conv_handler = ConversationHandler(
+    # Профіль
+    profile_handler = ConversationHandler(
         entry_points=[
             CommandHandler("newprofile", new_profile_start),
             CommandHandler("editprofile", new_profile_start)
@@ -911,19 +1310,33 @@ def main():
         fallbacks=[CommandHandler("cancel", profile_cancel)],
     )
     
-    app.add_handler(profile_conv_handler)
+    app.add_handler(profile_handler)
     
-    # Основні команди
+    # Команди
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("week", week_command))
     app.add_handler(CommandHandler("month", month_command))
     app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("notifications", notifications_command))
     
-    # Обробники повідомлень
+    # Callback (кнопки)
+    app.add_handler(CallbackQueryHandler(notification_toggle_callback, pattern="^notif_"))
+    app.add_handler(CallbackQueryHandler(button_callback, pattern="^delete_"))
+    
+    # Повідомлення
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Вечірній звіт о 21:00
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_daily(
+            send_evening_report,
+            time=time(hour=21, minute=0, second=0),
+            name="evening_report"
+        )
     
     print("🤖 Бот запущено!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
