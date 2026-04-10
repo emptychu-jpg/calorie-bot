@@ -27,7 +27,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ТВІЙ_TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "ТВІЙ_ANTHROPIC_API_KEY")
 
 # Ініціалізація Claude клієнта
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Client(api_key=ANTHROPIC_API_KEY)
 
 # ============== БАЗА ДАНИХ ==============
 def init_database():
