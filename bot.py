@@ -131,9 +131,10 @@ def get_stats(user_id: int, days: int = 1) -> dict:
     }
 
 # ============== АНАЛІЗ ФОТО ЧЕРЕЗ CLAUDE API ==============
-async def analyze_food_photo(photo_bytes: bytes) -> dict:
+async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None) -> dict:
     base64_image = base64.standard_b64encode(photo_bytes).decode("utf-8")
     
+    # Базовий промпт
     prompt = """Проаналізуй це фото їжі та дай оцінку українською мовою.
 
 Відповідь ОБОВ'ЯЗКОВО у форматі JSON (без markdown, тільки чистий JSON):
@@ -153,6 +154,18 @@ async def analyze_food_photo(photo_bytes: bytes) -> dict:
 {"error": "На фото не знайдено їжі"}
 
 Будь точним у підрахунку, враховуй видимий розмір порції."""
+
+    # Додаємо коментар користувача якщо є
+    if user_comment:
+        prompt += f"""
+
+ВАЖЛИВО! Користувач додав уточнення до фото:
+"{user_comment}"
+
+Обов'язково врахуй цю інформацію при аналізі! Наприклад:
+- Якщо вказано спосіб приготування (смажене, варене, печене) — врахуй це для калорій
+- Якщо вказано вагу порції — використай її замість візуальної оцінки
+- Якщо вказано інгредієнти — врахуй їх у підрахунку"""
 
     try:
         async with httpx.AsyncClient() as client:
@@ -218,10 +231,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Я твій персональний *Калорій Трекер* 🍎
 
 📸 *Як користуватися:*
-Просто надсилай мені фото своєї їжі, і я:
-- Розпізнаю що це за страва
-- Порахую калорії та БЖУ
-- Збережу в твою статистику
+Надсилай мені фото своєї їжі, і я:
+• Розпізнаю що це за страва
+• Порахую калорії та БЖУ
+• Збережу в твою статистику
+
+💡 *Підказка:* Можеш додати підпис до фото!
+Наприклад: "смажене на олії" або "порція 250г"
 
 📊 *Команди:*
 /today — статистика за сьогодні
@@ -238,8 +254,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🍎 *Калорій Трекер — Допомога*
 
 📸 *Як додати прийом їжі:*
-Просто сфотографуй свою їжу та надішли мені фото.
-Я автоматично розпізнаю страву та порахую калорії.
+Сфотографуй їжу та надішли мені.
+
+💡 *Можеш додати підпис до фото:*
+• "смажене на олії" — врахую спосіб приготування
+• "без цукру" — врахую особливості
+• "порція 300г" — використаю твою вагу
+• "курка, рис, овочі" — уточню інгредієнти
 
 📊 *Статистика:*
 /today — що ти їв сьогодні
@@ -247,9 +268,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /month — статистика за 30 днів
 
 ⚙️ *Поради:*
-- Фотографуй їжу зверху для кращого розпізнавання
-- Намагайся захопити всю порцію в кадр
-- Чим краща якість фото — тим точніший аналіз
+• Фотографуй їжу зверху для кращого розпізнавання
+• Намагайся захопити всю порцію в кадр
+• Додавай коментарі для точнішого підрахунку
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -334,20 +355,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id, user.first_name)
     
-    processing_msg = await update.message.reply_text("🔍 Аналізую фото...")
+    # Отримуємо підпис до фото (caption) якщо є
+    user_comment = update.message.caption
+    
+    # Повідомлення про обробку
+    if user_comment:
+        processing_msg = await update.message.reply_text(f"🔍 Аналізую фото з урахуванням: _{user_comment}_", parse_mode="Markdown")
+    else:
+        processing_msg = await update.message.reply_text("🔍 Аналізую фото...")
     
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         photo_bytes = await file.download_as_bytearray()
         
-        result = await analyze_food_photo(bytes(photo_bytes))
+        # Передаємо коментар в аналіз
+        result = await analyze_food_photo(bytes(photo_bytes), user_comment)
         
         if "error" in result:
             await processing_msg.edit_text(f"❌ {result['error']}")
             return
         
         save_meal(user.id, result)
+        
+        # Додаємо інформацію про врахований коментар
+        comment_note = ""
+        if user_comment:
+            comment_note = f"\n📝 Враховано: _{user_comment}_"
         
         response = f"""
 ✅ *Записано!*
@@ -362,7 +396,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📏 Порція: {result.get('portion_size', 'не визначено')}
 
-💡 {result.get('health_notes', '')}
+💡 {result.get('health_notes', '')}{comment_note}
 
 📊 /today — переглянути статистику за сьогодні
 """
@@ -374,6 +408,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📷 Надішли мені *фото їжі*, і я проаналізую його!\n\n"
+        "💡 Можеш додати підпис до фото для уточнення\n"
+        "(спосіб приготування, вага, інгредієнти)\n\n"
         "Або скористайся командами:\n"
         "/today — статистика за сьогодні\n"
         "/help — допомога",
@@ -397,6 +433,9 @@ def main():
     
     print("🤖 Бот запущено!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
