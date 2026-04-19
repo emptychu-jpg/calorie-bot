@@ -620,6 +620,95 @@ async def analyze_food_photo(photo_bytes: bytes, user_comment: str = None, user_
     except Exception as e:
         return {"error": f"Помилка аналізу: {str(e)}"}
 
+# ============== АНАЛІЗ ЇЖІ З ТЕКСТУ ЧЕРЕЗ CLAUDE API ==============
+async def analyze_food_text(text: str, user_profile: dict = None) -> dict:
+    """Аналізує опис їжі з тексту (без фото) і рахує калорії/БЖУ"""
+    
+    prompt = f"""Користувач описав що він з'їв українською мовою. Проаналізуй текст і порахуй калорії та БЖУ.
+
+ОПИС КОРИСТУВАЧА: "{text}"
+
+Відповідь ОБОВ'ЯЗКОВО у форматі JSON (без markdown, тільки чистий JSON):
+{{
+    "food_name": "Назва страви або продуктів",
+    "calories": число (приблизна кількість калорій),
+    "protein": число (грами білка),
+    "fat": число (грами жирів),
+    "carbs": число (грами вуглеводів),
+    "sugar": число (грами цукру),
+    "fiber": число (грами клітковини),
+    "portion_size": "оцінка розміру порції",
+    "health_notes": "короткий коментар про користь/шкоду",
+    "photo_description": "опис того, що з'їв користувач",
+    "personalized_tip": "персоналізована порада"
+}}
+
+Якщо текст НЕ описує їжу (наприклад, це питання, привітання, активність, випадкове повідомлення), поверни:
+{{"not_food": true}}
+
+ВАЖЛИВО:
+- Якщо розмір порції не вказано — припускай стандартну порцію для такого продукту
+- Якщо вказано "велика"/"маленька" порція — враховуй це
+- Якщо вказано вагу/кількість (напр. "200г курки", "2 яйця") — рахуй точно за цим
+- Будь реалістичним у підрахунку, не занижуй і не завищуй"""
+
+    if user_profile and user_profile.get("profile_complete"):
+        goal_text = {
+            "схуднення": "схуднути (потрібен дефіцит калорій, більше білка)",
+            "набір маси": "набрати м'язову масу (потрібен профіцит калорій, багато білка)",
+            "підтримка": "підтримувати поточну форму"
+        }.get(user_profile.get("goal"), "")
+        
+        prompt += f"""
+
+ПРОФІЛЬ КОРИСТУВАЧА:
+- Стать: {user_profile.get('gender')}
+- Вік: {user_profile.get('age')} років
+- Вага: {user_profile.get('weight')} кг
+- Ціль: {goal_text}
+- Денна норма: {user_profile.get('daily_calories')} ккал
+
+В полі "personalized_tip" дай пораду саме для цієї людини!"""
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "content-type": "application/json",
+                    "anthropic-version": "2023-06-01"
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 1024,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        }
+                    ],
+                },
+                timeout=60.0
+            )
+            
+            data = response.json()
+            response_text = data["content"][0]["text"]
+            
+            response_text = response_text.strip()
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+            response_text = response_text.strip()
+            
+            return json.loads(response_text)
+            
+    except json.JSONDecodeError:
+        return {"error": "Не вдалося розпізнати відповідь AI"}
+    except Exception as e:
+        return {"error": f"Помилка аналізу: {str(e)}"}
+
 # ============== CALLBACK HANDLERS (кнопки) ==============
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробка натискання inline кнопок"""
@@ -978,7 +1067,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Я твій *Калорій Трекер* 🍎
 
-📸 *Їжа:* надсилай фото — я порахую калорії
+📸 *Їжа (фото):* надсилай фото — я порахую калорії
+✍️ *Їжа (текст):* просто напиши що з'їв — наприклад "2 яйця і тост з авокадо"
 🏃 *Активність:* пиши текстом — "пробіжка 30 хв" або "8000 кроків"
 
 📊 *Команди:*
@@ -997,9 +1087,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 🍎 *Калорій Трекер — Допомога*
 
-📸 *Їжа:*
+📸 *Їжа (фото):*
 Надішли фото — я проаналізую.
 Можеш додати підпис: "300г", "без цукру"
+
+✍️ *Їжа (текст):*
+Просто напиши що з'їв, наприклад:
+• "з'їв 2 яйця і тост з авокадо"
+• "обід: борщ 300мл і котлета"
+• "випила каву з молоком і круасан"
+• "200г курки з гречкою"
 
 🏃 *Активність:*
 Напиши текстом, наприклад:
@@ -1223,10 +1320,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await processing_msg.edit_text(f"❌ Помилка: {str(e)}")
 
-# ============== ОБРОБКА ТЕКСТУ (активність) ==============
+# ============== ОБРОБКА ТЕКСТУ (активність або їжа) ==============
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = update.message.text.lower()
+    register_user(user.id, user.first_name)
+    
+    original_text = update.message.text
+    text = original_text.lower()
     
     # Перевіряємо чи це схоже на активність
     activity_keywords = [
@@ -1234,14 +1334,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'велосипед', 'велик', 'плавання', 'плавав', 'плавала', 'басейн',
         'тренування', 'тренажер', 'зал', 'gym', 'фітнес', 'йога',
         'танці', 'танцював', 'танцювала', 'футбол', 'баскетбол',
-        'хвилин', 'хв', 'година', 'год', 'min', 'час'
     ]
     
-    is_activity = any(keyword in text for keyword in activity_keywords)
+    # Ключові слова які сильно вказують що це їжа (щоб не плутати з активністю)
+    food_keywords = [
+        "з'їв", "з'їла", "поїв", "поїла", "з'їли", "їв", "їла", "їм", "їсти",
+        "випив", "випила", "пив", "пила", "випили",
+        "сніданок", "обід", "вечеря", "перекус", "снек",
+        "на сніданок", "на обід", "на вечерю",
+        "страва", "порція", "тарілка", "шматок", "кусок",
+        "грам", "г ", "мл ", "кг ",
+        "калорій", "ккал",
+        "круасан", "бутерброд", "салат", "суп", "борщ", "піца", "бургер",
+        "каша", "яєчня", "омлет", "яйце", "яйця", "курка", "м'ясо",
+        "риба", "риби", "рис", "гречка", "макарони", "паста",
+        "хліб", "булочка", "печиво", "тортик", "торт", "шоколад",
+        "кава", "чай", "молоко", "йогурт", "сир", "сметана",
+        "яблуко", "банан", "апельсин", "виноград",
+    ]
     
-    if is_activity:
+    is_food = any(keyword in text for keyword in food_keywords)
+    is_activity_word = any(keyword in text for keyword in activity_keywords)
+    
+    # Перевірка на час (може бути і в активності і в їжі, тому окремо)
+    has_time = bool(re.search(r'\d+\s*(?:хв|хвилин|мін|min|год|година|годин)', text))
+    
+    # Якщо є слова активності (АЛЕ немає яскравих слів їжі) — обробляємо як активність
+    if is_activity_word and not is_food:
         profile = get_user_profile(user.id)
-        activity = parse_activity(update.message.text, profile)
+        activity = parse_activity(original_text, profile)
         
         if activity["calories_burned"] > 0 or activity["steps"] > 0:
             activity_id = save_activity(user.id, activity)
@@ -1277,13 +1398,81 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
     
-    # Якщо не активність — стандартна відповідь
+    # Пробуємо розпізнати як опис їжі через Claude AI
+    # (якщо є яскраві слова їжі АБО текст достатньо довгий, щоб бути описом)
+    should_try_food = is_food or (len(original_text.split()) >= 2 and not is_activity_word)
+    
+    if should_try_food:
+        profile = get_user_profile(user.id)
+        processing_msg = await update.message.reply_text("🔍 Аналізую...")
+        
+        try:
+            result = await analyze_food_text(original_text, profile)
+            
+            # Claude сказав що це не їжа
+            if result.get("not_food"):
+                await processing_msg.delete()
+                # Падаємо далі — покажемо стандартну підказку
+            elif "error" in result:
+                await processing_msg.edit_text(f"❌ {result['error']}")
+                return
+            else:
+                # Зберігаємо їжу
+                meal_id = save_meal(user.id, result)
+                
+                response = f"""
+✅ *Записано!*
+
+🍽 *{result.get('food_name', 'Страва')}*
+
+🔥 Калорії: *{result.get('calories', 0)}* ккал
+🥩 Б: {result.get('protein', 0)}г 🧈 Ж: {result.get('fat', 0)}г 🍞 В: {result.get('carbs', 0)}г
+🍬 Цукор: {result.get('sugar', 0)}г 🥬 Клітковина: {result.get('fiber', 0)}г
+"""
+                
+                if result.get('personalized_tip'):
+                    response += f"\n💡 _{result.get('personalized_tip')}_"
+                
+                # Прогрес
+                if profile and profile.get("profile_complete"):
+                    stats = get_stats(user.id, days=1)
+                    cal_goal = profile["daily_calories"]
+                    cal_left = cal_goal - stats["calories"]
+                    
+                    if cal_left > 0:
+                        response += f"\n\n📊 {stats['calories']}/{cal_goal} ккал • Залишилось: *{cal_left}*"
+                    else:
+                        response += f"\n\n📊 {stats['calories']}/{cal_goal} ккал • ⚠️ +{abs(cal_left)}"
+                
+                # Додаємо підказку що можна уточнити
+                response += "\n\n_💬 Якщо цифри неточні — напиши деталі (вага, склад) і я перерахую_"
+                
+                keyboard = [[InlineKeyboardButton("🗑 Видалити", callback_data=f"delete_meal_{meal_id}")]]
+                
+                await processing_msg.edit_text(
+                    response,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+        except Exception as e:
+            try:
+                await processing_msg.edit_text(f"❌ Помилка: {str(e)}")
+            except:
+                pass
+            return
+    
+    # Якщо нічого не спрацювало — стандартна підказка
     await update.message.reply_text(
-        "📷 Надішли *фото їжі* — я проаналізую\n\n"
-        "🏃 Або напиши про активність:\n"
+        "🤔 Не зрозумів. Ти можеш:\n\n"
+        "📷 Надіслати *фото їжі* — я проаналізую\n\n"
+        "✍️ Або написати текстом що з'їв:\n"
+        "• «з'їв 2 яйця і тост з авокадо»\n"
+        "• «обід: борщ 300мл і котлета»\n"
+        "• «випила каву з молоком і круасан»\n\n"
+        "🏃 Або про активність:\n"
         "• «пробіжка 30 хв»\n"
-        "• «10000 кроків»\n"
-        "• «тренування 1 година»",
+        "• «10000 кроків»",
         parse_mode="Markdown"
     )
 
